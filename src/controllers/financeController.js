@@ -70,13 +70,32 @@ const getClientById = async (req, res) => {
       ORDER BY s.created_at DESC
     `, [id]);
 
+    // Traer los abonos detallados de cada venta (para poder mostrarlos/eliminarlos)
+    const saleIds = salesRows.map(s => s.id);
+    let paymentsMap = {};
+    if (saleIds.length > 0) {
+      const { rows: payRows } = await db.query(
+        'SELECT * FROM payments WHERE sale_id = ANY($1) ORDER BY created_at ASC',
+        [saleIds]
+      );
+      paymentsMap = payRows.reduce((acc, p) => {
+        (acc[p.sale_id] = acc[p.sale_id] || []).push(p);
+        return acc;
+      }, {});
+    }
+    // Adjuntar los abonos a cada venta
+    const salesWithPayments = salesRows.map(s => ({
+      ...s,
+      payments: paymentsMap[s.id] || []
+    }));
+
     const total_purchases = salesRows.reduce((acc, s) => acc + parseFloat(s.total_amount), 0);
     const total_paid = salesRows.reduce((acc, s) => acc + parseFloat(s.total_amount - s.pending_amount), 0);
     const pending_balance = total_purchases - total_paid;
 
     res.json({
       ...clientRows[0],
-      sales: salesRows,
+      sales: salesWithPayments,
       total_purchases,
       total_paid,
       pending_balance
@@ -291,6 +310,72 @@ const registerPayment = async (req, res) => {
     res.status(500).json({ error: 'Error al registrar pago' });
   }
 };
+// Eliminar un abono (cuando te pasaste de plata o te equivocaste)
+// - Elimina el abono de payments
+// - Elimina el movimiento de caja asociado (sale_credit_payment)
+// - Recalcula el status de la venta (si ya no está cubierta -> pending)
+const deletePayment = async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.query('BEGIN');
+
+    // Buscar el abono
+    const { rows } = await db.query('SELECT * FROM payments WHERE id = $1', [id]);
+    if (rows.length === 0) {
+      await db.query('ROLLBACK');
+      return res.status(404).json({ error: 'Abono no encontrado' });
+    }
+    const payment = rows[0];
+
+    // Eliminar el movimiento de caja asociado (sale_credit_payment)
+    // Coincide por reference_id (sale_id), type, amount y el más reciente
+    await db.query(`
+      DELETE FROM cash_movements
+      WHERE reference_table = 'sales'
+        AND reference_id = $1
+        AND type = 'sale_credit_payment'
+        AND amount = $2
+        AND id = (
+          SELECT id FROM cash_movements
+          WHERE reference_table = 'sales'
+            AND reference_id = $1
+            AND type = 'sale_credit_payment'
+            AND amount = $2
+          ORDER BY id DESC
+          LIMIT 1
+        )
+    `, [payment.sale_id, payment.amount]);
+
+    // Eliminar el abono
+    await db.query('DELETE FROM payments WHERE id = $1', [id]);
+
+    // Recalcular el status de la venta
+    const { rows: saleRows } = await db.query('SELECT * FROM sales WHERE id = $1', [payment.sale_id]);
+    let newStatus = saleRows.length > 0 ? saleRows[0].status : 'pending';
+    if (saleRows.length > 0) {
+      const sale = saleRows[0];
+      const { rows: paidRows } = await db.query(
+        'SELECT COALESCE(SUM(amount), 0) as total_paid FROM payments WHERE sale_id = $1',
+        [payment.sale_id]
+      );
+      newStatus = parseFloat(paidRows[0].total_paid) >= parseFloat(sale.total_amount) ? 'paid' : 'pending';
+      await db.query('UPDATE sales SET status = $1 WHERE id = $2', [newStatus, payment.sale_id]);
+    }
+
+    await db.query('COMMIT');
+    res.json({
+      message: 'Abono eliminado correctamente',
+      sale_id: payment.sale_id,
+      deleted_amount: payment.amount,
+      new_status: newStatus
+    });
+  } catch (error) {
+    await db.query('ROLLBACK');
+    console.error(error);
+    res.status(500).json({ error: 'Error al eliminar el abono' });
+  }
+};
+
 
 // ==========================================
 // 4. PRÉSTAMOS (ahora en ambas direcciones)
@@ -781,21 +866,76 @@ const deleteSale = async (req, res) => {
   }
 };
 
-// Nota: edición de venta se deja simple (no recalcula stock/caja).
-// Si el monto o producto cambia sustancialmente, es más seguro
-// eliminar la venta y volver a registrarla.
+// EDITAR VENTA (corregido)
+// - "product_name" NO es columna de la tabla sales (viene del JOIN con products),
+//   así que el UPDATE anterior siempre fallaba. Se corrige para que el frontend
+//   solo cambie el monto total.
+// - Se recalcula el status según los abonos ya registrados.
+// - Si era venta de contado, se sincroniza el movimiento de caja (sale_cash).
 const updateSale = async (req, res) => {
   const { id } = req.params;
-  const { product_name, total_amount } = req.body;
+  const { total_amount } = req.body;
+
+  const newAmount = parseFloat(total_amount);
+  if (isNaN(newAmount) || newAmount < 0) {
+    return res.status(400).json({ error: "El monto de la venta debe ser un número válido" });
+  }
+
   try {
-    const { rows } = await db.query(
-      'UPDATE sales SET product_name = $1, total_amount = $2 WHERE id = $3 RETURNING *',
-      [product_name, total_amount, id]
+    await db.query("BEGIN");
+
+    const { rows } = await db.query("SELECT * FROM sales WHERE id = $1", [id]);
+    if (rows.length === 0) {
+      await db.query("ROLLBACK");
+      return res.status(404).json({ error: "Venta no encontrada" });
+    }
+    const sale = rows[0];
+    const oldAmount = parseFloat(sale.total_amount);
+
+    // 1. Actualizar el monto total
+    await db.query(
+      "UPDATE sales SET total_amount = $1 WHERE id = $2",
+      [newAmount, id]
     );
-    res.json(rows[0]);
+
+    // 2. Recalcular el status: si los abonos ya cubren el nuevo total -> pagado
+    const { rows: paidRows } = await db.query(
+      "SELECT COALESCE(SUM(amount), 0) as total_paid FROM payments WHERE sale_id = $1",
+      [id]
+    );
+    const totalPaid = parseFloat(paidRows[0].total_paid);
+    const newStatus = totalPaid >= newAmount ? "paid" : "pending";
+    await db.query("UPDATE sales SET status = $1 WHERE id = $2", [newStatus, id]);
+
+    // 3. Si era una venta de contado, la plata que entró a caja
+    //    era por el monto viejo -> hay que ajustar el movimiento.
+    if (sale.sale_type === "contado" && oldAmount !== newAmount) {
+      await db.query(
+        `UPDATE cash_movements
+         SET amount = $1, description = $2
+         WHERE reference_table = "sales" AND reference_id = $3 AND type = "sale_cash"`,
+        [newAmount, `Venta de contado #${id} (monto corregido a ${newAmount})`, id]
+      );
+    }
+
+    await db.query("COMMIT");
+
+    // Devolver la venta con el nombre del producto para el frontend
+    const { rows: finalRows } = await db.query(`
+      SELECT s.*, c.name as client_name, p.name as product_name,
+      (s.total_amount - COALESCE(pay.total_paid, 0)) as pending_amount
+      FROM sales s
+      LEFT JOIN clients c ON s.client_id = c.id
+      LEFT JOIN products p ON s.product_id = p.id
+      LEFT JOIN (SELECT sale_id, SUM(amount) as total_paid FROM payments GROUP BY sale_id) pay ON s.id = pay.sale_id
+      WHERE s.id = $1
+    `, [id]);
+
+    res.json(finalRows[0]);
   } catch (error) {
+    await db.query("ROLLBACK");
     console.error(error);
-    res.status(500).json({ error: 'Error al actualizar venta' });
+    res.status(500).json({ error: "Error al actualizar venta" });
   }
 };
 
@@ -806,6 +946,7 @@ module.exports = {
   getClients, getClientById, createClient, updateClient, deleteClient,
   getSales, createSale, updateSale, deleteSale, getDebtors,
   registerPayment,
+  deletePayment,
   getLoans, createLoan, updateLoan, deleteLoan, registerLoanPayment,
   getExpenses, createExpense, updateExpense, deleteExpense,
   createInventoryPurchase, getInventoryPurchases,

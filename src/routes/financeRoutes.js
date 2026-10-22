@@ -4,7 +4,7 @@ const authMiddleware = require('../middleware/authMiddleware');
 const {
   getClients, getClientById, createClient, updateClient, deleteClient,
   getSales, createSale, updateSale, deleteSale, getDebtors,
-  registerPayment,
+  registerPayment, deletePayment,
   getLoans, createLoan, updateLoan, deleteLoan, registerLoanPayment,
   getExpenses, createExpense, updateExpense, deleteExpense,
   createInventoryPurchase, getInventoryPurchases,
@@ -32,6 +32,7 @@ router.get('/debtors', getDebtors);
 
 // Pagos (abonos a ventas a crédito)
 router.post('/payments', registerPayment);
+router.delete('/payments/:id', deletePayment);
 
 // Préstamos
 router.get('/loans', getLoans);

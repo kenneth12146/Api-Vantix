@@ -382,11 +382,57 @@ const deletePayment = async (req, res) => {
 // direction = 'nos_deben' -> Vantix prestó plata (sale de caja, alguien nos debe)
 // direction = 'debemos'   -> Vantix pidió prestado (entra a caja, nosotros debemos)
 // ==========================================
+
+// Calcula y valida el interés de un préstamo. Devuelve valores listos para
+// guardar. IMPORTANTE: solo produce datos informativos; nunca escribe en
+// cash_movements, para no alterar los balances existentes.
+//
+//   simple  -> interés = capital * (tasa/100)          (una sola vez)
+//   mensual -> interés = capital * (tasa/100) * plazo  (tasa por mes)
+const normalizeInterest = (body) => {
+  const rate = body.interest_rate === undefined || body.interest_rate === '' || body.interest_rate === null
+    ? 0
+    : Number(body.interest_rate);
+  const type = body.interest_type === 'mensual' ? 'mensual' : 'simple';
+  const months = body.term_months === undefined || body.term_months === '' || body.term_months === null
+    ? 0
+    : parseInt(body.term_months, 10);
+
+  if (!Number.isFinite(rate) || rate < 0) {
+    return { error: 'El porcentaje de interés debe ser un número mayor o igual a 0' };
+  }
+  if (!Number.isFinite(months) || months < 0) {
+    return { error: 'El plazo en meses debe ser un número entero mayor o igual a 0' };
+  }
+
+  // Si viene interest_amount explícito se respeta (el frontend y el backend
+  // usan la misma fórmula); si no, se calcula aquí a partir del capital.
+  const capital = Number(body.total_amount) || 0;
+  let amount;
+  if (body.interest_amount !== undefined && body.interest_amount !== '' && body.interest_amount !== null) {
+    amount = Number(body.interest_amount);
+  } else {
+    amount = type === 'mensual' ? capital * (rate / 100) * months : capital * (rate / 100);
+  }
+  if (!Number.isFinite(amount) || amount < 0) {
+    return { error: 'El interés calculado no es válido' };
+  }
+
+  return {
+    rate: Math.round(rate * 100) / 100,
+    type,
+    months,
+    amount: Math.round(amount * 100) / 100,
+  };
+};
 const getLoans = async (req, res) => {
   const { direction } = req.query;
   try {
     let query = `
-      SELECT l.*, COALESCE(SUM(lp.amount), 0) as total_paid
+      SELECT l.*,
+             COALESCE(SUM(lp.amount), 0) as total_paid,
+             GREATEST(ROUND((l.interest_amount - COALESCE(l.interest_paid, 0))::numeric, 2), 0) as interest_pending,
+             ROUND((l.total_amount - COALESCE(SUM(lp.amount), 0))::numeric, 2) as capital_pending
       FROM loans l
       LEFT JOIN loan_payments lp ON l.id = lp.loan_id
     `;
@@ -408,6 +454,13 @@ const createLoan = async (req, res) => {
   const { party_name, direction, total_amount, description, cedula, loan_date } = req.body;
   const dir = direction === 'debemos' ? 'debemos' : 'nos_deben';
 
+  // Interés pactado (opcional). Es informativo: NO genera movimientos de
+  // caja ni altera el capital de `total_amount`.
+  const interest = normalizeInterest(req.body);
+  if (interest.error) {
+    return res.status(400).json({ error: interest.error });
+  }
+
   // Validación explícita: si esto falla, el frontend ahora muestra
   // el motivo real en vez de un error genérico.
   if (!party_name || !party_name.trim()) {
@@ -424,13 +477,19 @@ const createLoan = async (req, res) => {
     let rows;
     if (loan_date) {
       ({ rows } = await db.query(
-        'INSERT INTO loans (party_name, direction, total_amount, description, cedula, created_at) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-        [party_name.trim(), dir, amountNum, description, cedula || null, loan_date]
+        `INSERT INTO loans (party_name, direction, total_amount, description, cedula, created_at,
+                            interest_rate, interest_type, term_months, interest_amount)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+        [party_name.trim(), dir, amountNum, description, cedula || null, loan_date,
+         interest.rate, interest.type, interest.months, interest.amount]
       ));
     } else {
       ({ rows } = await db.query(
-        'INSERT INTO loans (party_name, direction, total_amount, description, cedula) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-        [party_name.trim(), dir, amountNum, description, cedula || null]
+        `INSERT INTO loans (party_name, direction, total_amount, description, cedula,
+                            interest_rate, interest_type, term_months, interest_amount)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+        [party_name.trim(), dir, amountNum, description, cedula || null,
+         interest.rate, interest.type, interest.months, interest.amount]
       ));
     }
     const loan = rows[0];
@@ -460,10 +519,26 @@ const createLoan = async (req, res) => {
 const updateLoan = async (req, res) => {
   const { id } = req.params;
   const { party_name, total_amount, description, cedula } = req.body;
+  // Si el body trae campos de interés se actualizan; si no, se conservan.
+  const touchesInterest = ['interest_rate', 'interest_type', 'term_months', 'interest_amount']
+    .some(k => req.body[k] !== undefined);
+  const interest = touchesInterest ? normalizeInterest(req.body) : null;
+  if (interest && interest.error) {
+    return res.status(400).json({ error: interest.error });
+  }
   try {
     const { rows } = await db.query(
-      'UPDATE loans SET party_name = $1, total_amount = $2, description = $3, cedula = $4 WHERE id = $5 RETURNING *',
-      [party_name, total_amount, description, cedula || null, id]
+      `UPDATE loans SET party_name = $1, total_amount = $2, description = $3, cedula = $4,
+              interest_rate   = COALESCE($6, interest_rate),
+              interest_type   = COALESCE($7, interest_type),
+              term_months     = COALESCE($8, term_months),
+              interest_amount = COALESCE($9, interest_amount)
+       WHERE id = $5 RETURNING *`,
+      [party_name, total_amount, description, cedula || null, id,
+       interest ? interest.rate : null,
+       interest ? interest.type : null,
+       interest ? interest.months : null,
+       interest ? interest.amount : null]
     );
     if (rows.length === 0) {
       return res.status(404).json({ error: 'Préstamo no encontrado' });
@@ -942,12 +1017,158 @@ const updateSale = async (req, res) => {
 // ==========================================
 // EXPORTACIONES
 // ==========================================
+// ==========================================
+// Cobro de INTERESES de un préstamo
+//
+// El interés vive separado del capital en todo momento:
+//   - loans.total_amount  → capital (NO se modifica aquí)
+//   - loans.interest_amount → interés pactado (fijo)
+//   - loans.interest_paid → interés ya cobrado (se acumula aquí)
+//
+// Cada cobro genera su PROPIO movimiento de caja, con tipo
+// 'loan_interest_received', para poder distinguir en la contabilidad
+// cuánto entró por capital y cuánto por intereses.
+//
+// Dirección del movimiento:
+//   nos_deben (yo presté, cobro intereses) → 'in'  (entra plata)
+//   debemos   (me prestaron, pago intereses) → 'out' (sale plata)
+//
+// Se puede cobrar en varias cuotas; nunca se puede superar el pactado.
+// ==========================================
+const registerInterestPayment = async (req, res) => {
+  const { id } = req.params;
+  const { amount, payment_date } = req.body;
+  const amountNum = Number(amount);
+
+  if (!Number.isFinite(amountNum) || amountNum <= 0) {
+    return res.status(400).json({ error: 'El monto debe ser mayor a 0' });
+  }
+
+  try {
+    await db.query('BEGIN');
+
+    // Bloqueo de fila para que dos cobros simultáneos no se pisen.
+    const { rows: loanRows } = await db.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [id]);
+    if (loanRows.length === 0) {
+      await db.query('ROLLBACK');
+      return res.status(404).json({ error: 'Préstamo no encontrado' });
+    }
+
+    const loan = loanRows[0];
+    const interestAmount = Number(loan.interest_amount) || 0;
+    const interestPaid = Number(loan.interest_paid) || 0;
+    const pending = Math.round((interestAmount - interestPaid) * 100) / 100;
+
+    if (interestAmount <= 0) {
+      await db.query('ROLLBACK');
+      return res.status(400).json({ error: 'Este préstamo no tiene intereses pactados' });
+    }
+    if (pending <= 0) {
+      await db.query('ROLLBACK');
+      return res.status(400).json({ error: 'Este préstamo ya tiene los intereses cobrados en su totalidad' });
+    }
+    if (amountNum > pending) {
+      await db.query('ROLLBACK');
+      return res.status(400).json({
+        error: `El monto supera el interés pendiente (${pending.toFixed(2)})`
+      });
+    }
+
+    // Acumular el cobro. Se redondea a 2 decimales para evitar arrastres
+    // de coma flotante que romperían el CHECK (interest_paid <= interest_amount).
+    const { rows: updated } = await db.query(
+      `UPDATE loans
+       SET interest_paid = ROUND((COALESCE(interest_paid, 0) + $2)::numeric, 2)
+       WHERE id = $1
+       RETURNING *`,
+      [id, amountNum]
+    );
+
+    const isLender = loan.direction !== 'debemos';
+
+    await logCashMovement({
+      type: 'loan_interest_received',
+      direction: isLender ? 'in' : 'out',
+      amount: amountNum,
+      reference_table: 'loans',
+      reference_id: id,
+      description: isLender
+        ? `Intereses cobrados a ${loan.party_name}`
+        : `Intereses pagados a ${loan.party_name}`,
+      created_at: payment_date || null,
+    });
+
+    await db.query('COMMIT');
+
+    res.json({
+      message: 'Interés registrado en caja',
+      loan: updated[0],
+      interest_pending: Math.round((interestAmount - Number(updated[0].interest_paid)) * 100) / 100,
+    });
+  } catch (error) {
+    await db.query('ROLLBACK');
+    console.error(error);
+    res.status(500).json({ error: 'Error al registrar el cobro de intereses' });
+  }
+};
+
+// ==========================================
+// Quitar el interés pactado de un préstamo
+//
+// Solo se permite si NO se ha cobrado nada (interest_paid = 0). Si ya hay
+// cobros registrados, habría movimientos reales en cash_movements que
+// quedarían sin respaldo y la caja se descuadraría.
+//
+// El capital (total_amount) NUNCA se toca: quitar el interés devuelve el
+// préstamo exactamente a como estaba antes de pactarlo.
+// ==========================================
+const removeLoanInterest = async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.query('BEGIN');
+
+    const { rows } = await db.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [id]);
+    if (rows.length === 0) {
+      await db.query('ROLLBACK');
+      return res.status(404).json({ error: 'Préstamo no encontrado' });
+    }
+
+    const loan = rows[0];
+    const paid = Number(loan.interest_paid) || 0;
+
+    if (paid > 0) {
+      await db.query('ROLLBACK');
+      return res.status(400).json({
+        error: `No se puede quitar: ya se cobraron ${paid.toFixed(2)} en intereses. Este dinero ya está registrado en caja.`,
+      });
+    }
+
+    const { rows: updated } = await db.query(
+      `UPDATE loans
+       SET interest_rate = 0,
+           interest_type = 'simple',
+           term_months = 0,
+           interest_amount = 0
+       WHERE id = $1
+       RETURNING *`,
+      [id]
+    );
+
+    await db.query('COMMIT');
+    res.json({ message: 'Interés eliminado del préstamo', loan: updated[0] });
+  } catch (error) {
+    await db.query('ROLLBACK');
+    console.error(error);
+    res.status(500).json({ error: 'Error al quitar el interés' });
+  }
+};
+
 module.exports = {
   getClients, getClientById, createClient, updateClient, deleteClient,
   getSales, createSale, updateSale, deleteSale, getDebtors,
   registerPayment,
   deletePayment,
-  getLoans, createLoan, updateLoan, deleteLoan, registerLoanPayment,
+  getLoans, createLoan, updateLoan, deleteLoan, registerLoanPayment, registerInterestPayment, removeLoanInterest,
   getExpenses, createExpense, updateExpense, deleteExpense,
   createInventoryPurchase, getInventoryPurchases,
   createBankMovement, getBankInvestments,

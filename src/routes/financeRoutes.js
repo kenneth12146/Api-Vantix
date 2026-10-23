@@ -5,7 +5,7 @@ const {
   getClients, getClientById, createClient, updateClient, deleteClient,
   getSales, createSale, updateSale, deleteSale, getDebtors,
   registerPayment, deletePayment,
-  getLoans, createLoan, updateLoan, deleteLoan, registerLoanPayment,
+  getLoans, createLoan, updateLoan, deleteLoan, registerLoanPayment, registerInterestPayment, removeLoanInterest,
   getExpenses, createExpense, updateExpense, deleteExpense,
   createInventoryPurchase, getInventoryPurchases,
   createBankMovement, getBankInvestments,
@@ -40,6 +40,8 @@ router.post('/loans', createLoan);
 router.put('/loans/:id', updateLoan);           // NUEVA
 router.delete('/loans/:id', deleteLoan);         // NUEVA
 router.post('/loans/:id/payments', registerLoanPayment);
+router.post('/loans/:id/interest-payments', registerInterestPayment);
+router.delete('/loans/:id/interest', removeLoanInterest);
 
 // Gastos operativos
 router.get('/expenses', getExpenses);

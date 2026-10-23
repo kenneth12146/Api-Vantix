@@ -18,7 +18,7 @@ const EXPORT_TABLES = {
   sales:              { label: 'Ventas', cols: ['id','client_id','product_id','total_amount','sale_type','status','quantity','created_at'] },
   expenses:           { label: 'Gastos', cols: ['id','description','amount','category','created_at'] },
   cash_movements:     { label: 'Movimientos de Caja', cols: ['id','type','direction','amount','reference_table','reference_id','description','created_at'] },
-  loans:              { label: 'Préstamos', cols: ['id','debtor_name','party_name','total_amount','description','status','direction','cedula','interest_rate','interest_type','term_months','interest_amount','created_at'] },
+  loans:              { label: 'Préstamos', cols: ['id','debtor_name','party_name','total_amount','description','status','direction','cedula','interest_rate','interest_type','term_months','interest_amount','interest_paid','created_at'] },
   payments:           { label: 'Pagos (abonos)', cols: ['id','sale_id','amount','payment_method','created_at'] },
   loan_payments:      { label: 'Pagos de Préstamos', cols: ['id','loan_id','amount','created_at'] },
   inventory_purchases:{ label: 'Compras de Inventario', cols: ['id','product_id','quantity','unit_cost','total_cost','description','created_at'] },
